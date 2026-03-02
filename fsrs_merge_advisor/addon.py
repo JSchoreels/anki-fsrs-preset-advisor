@@ -40,14 +40,19 @@ from .analyzer import (
 )
 from .deck_tools import (
     build_deck_search_query,
+    build_multi_deck_search_query,
     can_reuse_cached_params,
+    changed_target_preset_ids_from_assignments,
     count_relearning_steps_in_day,
+    deck_ids_grouped_by_target_preset,
     descendant_deck_ids,
     leaf_deck_entries,
     max_distance_to_group_for_item,
     max_pairwise_distance_for_group,
     optimization_progress_message,
+    preset_optimization_progress_message,
     recommended_group_preset_name,
+    set_fsrs_params_on_config_payload,
     similar_items_below_threshold,
     similarity_groups_from_matrix,
 )
@@ -518,6 +523,124 @@ def _compute_fsrs_params_for_deck(
         params = ()
     fsrs_items = _as_int(_field_any(response, ("fsrs_items", "fsrsItems"))) or 0
     return params, fsrs_items
+
+
+def _optimize_preset_configs(
+    preset_deck_groups: Sequence[tuple[int, Sequence[int]]],
+) -> tuple[int, int, int, int, bool]:
+    update_config = getattr(mw.col.decks, "update_config", None)
+    total = len(preset_deck_groups)
+    if total == 0:
+        return 0, 0, 0, 0, False
+
+    progress = QProgressDialog("Preparing preset optimizations...", "Cancel", 0, total, mw)
+    progress.setWindowTitle("Optimize Changed Presets")
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.setMinimumDuration(0)
+    progress.setValue(0)
+
+    optimized = 0
+    no_data = 0
+    invalid_params = 0
+    failed = 0
+    cancelled = False
+    processed = 0
+
+    def _set_progress(done: int, preset_name: str | None) -> None:
+        progress.setMaximum(max(total, 0))
+        progress.setValue(min(done, total))
+        progress.setLabelText(
+            preset_optimization_progress_message(
+                done=done,
+                total=total,
+                preset_name=preset_name,
+            )
+        )
+        progress.show()
+        progress.repaint()
+        mw.app.processEvents()
+        progress.repaint()
+
+    try:
+        _set_progress(0, None)
+        for conf_id, deck_ids in preset_deck_groups:
+            if progress.wasCanceled():
+                cancelled = True
+                break
+
+            config = _config_from_conf_id(conf_id)
+            conf_name = _config_name(conf_id, config) if config is not None else f"Preset {conf_id}"
+            _set_progress(processed, conf_name)
+
+            if not callable(update_config) or config is None:
+                failed += 1
+                processed += 1
+                _set_progress(processed, None)
+                continue
+
+            search = build_multi_deck_search_query(deck_ids)
+            if search is None:
+                failed += 1
+                processed += 1
+                _set_progress(processed, None)
+                continue
+
+            try:
+                params, fsrs_items = _compute_fsrs_params_for_deck(
+                    search=search,
+                    current_params=extract_fsrs_weights(config) or (),
+                    num_of_relearning_steps=count_relearning_steps_in_day(
+                        _extract_relearning_steps(config)
+                    ),
+                )
+            except Exception:
+                failed += 1
+                processed += 1
+                _set_progress(processed, None)
+                continue
+
+            if fsrs_items <= 0:
+                no_data += 1
+                processed += 1
+                _set_progress(processed, None)
+                continue
+            if not is_fsrs6_valid_params(params):
+                invalid_params += 1
+                processed += 1
+                _set_progress(processed, None)
+                continue
+
+            try:
+                cloned = copy.deepcopy(config)
+                if not isinstance(cloned, Mapping):
+                    raise RuntimeError("Invalid target preset payload")
+                payload = dict(cloned)
+                payload["id"] = int(conf_id)
+                payload_name = _field(payload, "name")
+                if not isinstance(payload_name, str) or not payload_name:
+                    payload["name"] = conf_name
+                payload = set_fsrs_params_on_config_payload(
+                    config_payload=payload,
+                    params=params,
+                )
+                update_config(payload)
+                optimized += 1
+            except Exception:
+                failed += 1
+
+            processed += 1
+            _set_progress(processed, None)
+    finally:
+        progress.close()
+
+    if optimized:
+        try:
+            mw.reset()
+        except Exception:
+            pass
+
+    return optimized, no_data, invalid_params, failed, cancelled
 
 
 def _load_computed_deck_profiles(
@@ -1270,6 +1393,7 @@ def _show_similarity_groups(
         settings_copy_failed = 0
         failed = 0
         target_by_deck: dict[int, int] = {}
+        recommended_conf_ids: list[int] = []
 
         for group_number, indexes in enumerate(recommended_group_indexes, start=1):
             valid_indexes = [idx for idx in indexes if 0 <= idx < len(deck_ids)]
@@ -1333,9 +1457,13 @@ def _show_similarity_groups(
 
             for idx in valid_indexes:
                 target_by_deck[deck_ids[idx]] = int(new_conf_id)
+            if int(new_conf_id) not in recommended_conf_ids:
+                recommended_conf_ids.append(int(new_conf_id))
 
+        before_assignments: dict[int, int] = {}
         if target_by_deck:
-            _save_preset_backup(_current_preset_assignments(list(target_by_deck.keys())))
+            before_assignments = _current_preset_assignments(list(target_by_deck.keys()))
+            _save_preset_backup(before_assignments)
             assigned, apply_failed = _apply_preset_assignments(target_by_deck)
             failed += apply_failed
         else:
@@ -1365,6 +1493,45 @@ def _show_similarity_groups(
                 f"and reassigned {assigned} decks.\n\n"
                 "Reopen this window to refresh existing preset groups."
             )
+
+        after_target_assignments = _current_preset_assignments(list(target_by_deck.keys()))
+        changed_recommended_conf_ids = changed_target_preset_ids_from_assignments(
+            before_assignments=before_assignments,
+            after_assignments=after_target_assignments,
+            target_by_deck=target_by_deck,
+            candidate_preset_ids=recommended_conf_ids,
+        )
+        all_deck_ids = [deck_id for deck_id, _deck_name in _deck_entries()]
+        all_current_assignments = _current_preset_assignments(all_deck_ids)
+        changed_preset_deck_groups = deck_ids_grouped_by_target_preset(
+            target_by_deck=all_current_assignments,
+            preset_ids=changed_recommended_conf_ids,
+        )
+        if changed_preset_deck_groups:
+            optimize_choice = QMessageBox.question(
+                dialog,
+                "Optimize Changed Presets?",
+                "Do you want to optimize FSRS params for advisor presets whose deck composition changed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if optimize_choice == QMessageBox.StandardButton.Yes:
+                optimized, no_data, invalid_params, optimization_failed, cancelled = (
+                    _optimize_preset_configs(changed_preset_deck_groups)
+                )
+                lines = [
+                    f"Optimized presets: {optimized}",
+                    f"Skipped (no FSRS items): {no_data}",
+                    f"Skipped (non-FSRS6 params): {invalid_params}",
+                    f"Failed: {optimization_failed}",
+                ]
+                if cancelled:
+                    lines.append("Cancelled before completion.")
+                message = "Preset optimization summary:\n" + "\n".join(lines)
+                if optimization_failed:
+                    showWarning(message)
+                else:
+                    showInfo(message)
         dialog.accept()
 
     recommended_button.clicked.connect(_use_recommended_groups)

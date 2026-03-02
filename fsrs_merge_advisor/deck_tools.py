@@ -1,6 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+_FSRS_CONFIG_PARAM_KEYS = (
+    "fsrsParams6",
+    "fsrs_params6",
+    "fsrsParams5",
+    "fsrs_params5",
+    "fsrsParams",
+    "fsrs_params",
+    "fsrsWeights",
+    "fsrs_weights",
+)
 
 
 def leaf_deck_entries(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
@@ -63,6 +75,113 @@ def optimization_progress_message(
             f"Remaining: {remaining}"
         )
     return f"Preparing deck optimizations...\nCompleted: {done}/{total}\nRemaining: {remaining}"
+
+
+def preset_optimization_progress_message(
+    *,
+    done: int,
+    total: int,
+    preset_name: str | None = None,
+) -> str:
+    remaining = max(total - done, 0)
+    if preset_name:
+        return (
+            f'Optimizing preset "{preset_name}"\n'
+            f"Completed: {done}/{total}\n"
+            f"Remaining: {remaining}"
+        )
+    return f"Preparing preset optimizations...\nCompleted: {done}/{total}\nRemaining: {remaining}"
+
+
+def build_multi_deck_search_query(deck_ids: Sequence[int]) -> str | None:
+    unique_ids: list[int] = []
+    seen: set[int] = set()
+    for deck_id in deck_ids:
+        value = int(deck_id)
+        if value <= 0 or value in seen:
+            continue
+        seen.add(value)
+        unique_ids.append(value)
+
+    if not unique_ids:
+        return None
+    if len(unique_ids) == 1:
+        return f"did:{unique_ids[0]} -is:suspended"
+
+    joined = " OR ".join(f"did:{deck_id}" for deck_id in unique_ids)
+    return f"({joined}) -is:suspended"
+
+
+def deck_ids_grouped_by_target_preset(
+    *,
+    target_by_deck: Mapping[int, int],
+    preset_ids: Sequence[int],
+) -> list[tuple[int, list[int]]]:
+    grouped: list[tuple[int, list[int]]] = []
+    for preset_id in preset_ids:
+        deck_ids = [
+            int(deck_id)
+            for deck_id, assigned_preset in target_by_deck.items()
+            if int(assigned_preset) == int(preset_id)
+        ]
+        if deck_ids:
+            grouped.append((int(preset_id), deck_ids))
+    return grouped
+
+
+def changed_target_preset_ids_from_assignments(
+    *,
+    before_assignments: Mapping[int, int],
+    after_assignments: Mapping[int, int],
+    target_by_deck: Mapping[int, int],
+    candidate_preset_ids: Sequence[int],
+) -> list[int]:
+    candidate_set = {int(preset_id) for preset_id in candidate_preset_ids}
+    changed_set: set[int] = set()
+
+    for raw_deck_id in target_by_deck:
+        deck_id = int(raw_deck_id)
+        before_preset = before_assignments.get(deck_id)
+        after_preset = after_assignments.get(deck_id)
+        if before_preset == after_preset:
+            continue
+        if before_preset is not None and int(before_preset) in candidate_set:
+            changed_set.add(int(before_preset))
+        if after_preset is not None and int(after_preset) in candidate_set:
+            changed_set.add(int(after_preset))
+
+    return [int(preset_id) for preset_id in candidate_preset_ids if int(preset_id) in changed_set]
+
+
+def set_fsrs_params_on_config_payload(
+    *,
+    config_payload: Mapping[str, Any],
+    params: Sequence[float],
+) -> dict[str, Any]:
+    payload = dict(config_payload)
+    params_list = [float(value) for value in params]
+    updated = False
+
+    for key in _FSRS_CONFIG_PARAM_KEYS:
+        if key in payload:
+            payload[key] = list(params_list)
+            updated = True
+
+    fsrs_obj = payload.get("fsrs")
+    if isinstance(fsrs_obj, Mapping):
+        fsrs_payload = dict(fsrs_obj)
+        fsrs_updated = False
+        for key in ("weights", "params", "parameters"):
+            if key in fsrs_payload:
+                fsrs_payload[key] = list(params_list)
+                fsrs_updated = True
+        if fsrs_updated:
+            payload["fsrs"] = fsrs_payload
+            updated = True
+
+    if not updated:
+        payload["fsrsParams6"] = list(params_list)
+    return payload
 
 
 def can_reuse_cached_params(
