@@ -38,24 +38,26 @@ from .analyzer import (
     is_fsrs6_valid_params,
     pairwise_distance_matrix,
 )
-from .deck_tools import (
-    build_deck_search_query,
-    build_multi_deck_search_query,
-    can_reuse_cached_params,
+from .tools.assignment_changes import (
     changed_target_preset_ids_from_assignments,
-    count_relearning_steps_in_day,
     deck_ids_grouped_by_target_preset,
-    descendant_deck_ids,
-    leaf_deck_entries,
+)
+from .tools.cache import can_reuse_cached_params
+from .tools.deck_scope import descendant_deck_ids, leaf_deck_entries
+from .tools.fsrs_payload import set_fsrs_params_on_config_payload
+from .tools.grouping import (
     max_distance_to_group_for_item,
     max_pairwise_distance_for_group,
-    optimization_progress_message,
-    preset_optimization_progress_message,
     recommended_group_preset_name,
-    set_fsrs_params_on_config_payload,
     similar_items_below_threshold,
     similarity_groups_from_matrix,
 )
+from .tools.progress_messages import (
+    optimization_progress_message,
+    preset_optimization_progress_message,
+)
+from .tools.relearning import count_relearning_steps_in_day
+from .tools.search_queries import build_deck_search_query, build_multi_deck_search_query
 from .reference_covariance import FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD
 
 _ACTION_LABEL = "FSRS Preset Proximity"
