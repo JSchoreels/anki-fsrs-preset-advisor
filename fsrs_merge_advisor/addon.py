@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import copy
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -10,6 +11,7 @@ from aqt.qt import (
     QAbstractItemView,
     QAction,
     QColor,
+    QComboBox,
     QDialog,
     QGroupBox,
     QHBoxLayout,
@@ -47,7 +49,6 @@ from .deck_tools import (
     recommended_group_preset_name,
     similar_items_below_threshold,
     similarity_groups_from_matrix,
-    unique_name,
 )
 from .reference_covariance import FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD
 
@@ -763,6 +764,7 @@ def _show_similarity_groups(
     deck_ids: Sequence[int],
     distances: Sequence[Sequence[float | None]],
     preset_groups: Sequence[tuple[int, str, Sequence[int]]] | None,
+    open_proximity_callback: Callable[[], None] | None = None,
 ) -> None:
     if not groups:
         showInfo(
@@ -864,9 +866,10 @@ def _show_similarity_groups(
     left_scroll.setWidgetResizable(True)
     left_container = QWidget(left_scroll)
     left_container_layout = QVBoxLayout(left_container)
-    left_header = QLabel("Existing Preset Groups (drag decks between presets)", left_container)
+    left_header = QLabel("Left Panel: Presets Editor (drag decks between presets)", left_container)
     left_container_layout.addWidget(left_header)
     preset_widgets: list[tuple[int, str, QGroupBox, QLabel, QListWidget]] = []
+    initial_preset_indexes: list[list[int]] = []
     for preset_id, preset_name, member_indexes in preset_groups or []:
         box = QGroupBox(preset_name, left_container)
         box_layout = QVBoxLayout(box)
@@ -885,6 +888,7 @@ def _show_similarity_groups(
         box_layout.addWidget(list_widget)
         left_container_layout.addWidget(box)
         preset_widgets.append((preset_id, preset_name, box, stats_label, list_widget))
+        initial_preset_indexes.append([int(idx) for idx in member_indexes])
     left_scroll.setWidget(left_container)
     split_layout.addWidget(left_scroll)
 
@@ -892,7 +896,9 @@ def _show_similarity_groups(
     right_scroll.setWidgetResizable(True)
     container = QWidget(right_scroll)
     container_layout = QVBoxLayout(container)
-    right_header = QLabel("Similarity Groups (drag decks between groups)", container)
+    right_header = QLabel(
+        "Right Panel: Similarity Groups (drag decks between groups)", container
+    )
     container_layout.addWidget(right_header)
     group_widgets: list[tuple[int, QGroupBox, QLabel, QListWidget]] = []
 
@@ -931,6 +937,11 @@ def _show_similarity_groups(
 
     def _populate_group_widgets(index_groups: Sequence[Sequence[int]]) -> None:
         for group_idx, (_, _, _, list_widget) in enumerate(group_widgets):
+            indexes = index_groups[group_idx] if group_idx < len(index_groups) else ()
+            _populate_list_widget(list_widget, indexes)
+
+    def _populate_preset_widgets(index_groups: Sequence[Sequence[int]]) -> None:
+        for group_idx, (_, _, _, _, list_widget) in enumerate(preset_widgets):
             indexes = index_groups[group_idx] if group_idx < len(index_groups) else ()
             _populate_list_widget(list_widget, indexes)
 
@@ -1116,10 +1127,29 @@ def _show_similarity_groups(
     split_layout.addWidget(right_scroll)
     layout.addLayout(split_layout)
 
+    default_values_layout = QHBoxLayout()
+    default_values_layout.addWidget(QLabel("Preset Default Values:", dialog))
+    preset_defaults_combo = QComboBox(dialog)
+    preset_defaults_combo.addItem("Auto (per-group source preset)", None)
+    for conf_id, conf_name, _ in _all_preset_configs():
+        preset_defaults_combo.addItem(conf_name, int(conf_id))
+    default_values_layout.addWidget(preset_defaults_combo)
+    layout.addLayout(default_values_layout)
+
     buttons_layout = QHBoxLayout()
+    if open_proximity_callback is not None:
+        proximity_button = QPushButton("See Proximity Matrix", dialog)
+        proximity_button.clicked.connect(open_proximity_callback)
+        buttons_layout.addWidget(proximity_button)
+
     reset_button = QPushButton("Reset Groups", dialog)
     reset_button.clicked.connect(
-        lambda: (_populate_group_widgets(initial_group_indexes), _refresh_similarity_views())
+        lambda: (
+            _populate_group_widgets(initial_group_indexes),
+            _populate_preset_widgets(initial_preset_indexes),
+            _refresh_similarity_views(),
+            _refresh_preset_views(),
+        )
     )
     buttons_layout.addWidget(reset_button)
 
@@ -1158,48 +1188,84 @@ def _show_similarity_groups(
     def _use_recommended_groups() -> None:
         create_config_id = getattr(mw.col.decks, "add_config_returning_id", None)
         create_config = getattr(mw.col.decks, "add_config", None)
+        update_config = getattr(mw.col.decks, "update_config", None)
+        selected_default_conf_id = _as_int(preset_defaults_combo.currentData())
+        selected_default_conf = (
+            _config_from_conf_id(selected_default_conf_id)
+            if selected_default_conf_id is not None
+            else None
+        )
 
-        existing_names = [name for _, name, _ in _all_preset_configs()]
+        existing_by_name: dict[str, int] = {}
+        for conf_id, conf_name, _ in _all_preset_configs():
+            if conf_name not in existing_by_name:
+                existing_by_name[conf_name] = int(conf_id)
         created = 0
+        reused = 0
+        copied_settings = 0
+        settings_copy_failed = 0
         failed = 0
         target_by_deck: dict[int, int] = {}
 
         for group_number, indexes in enumerate(initial_group_indexes, start=1):
             valid_indexes = [idx for idx in indexes if 0 <= idx < len(deck_ids)]
-            if len(valid_indexes) < 2:
+            if len(valid_indexes) < 1:
                 continue
 
             base_name = recommended_group_preset_name(group_number)
-            preset_name = unique_name(base_name, existing_names)
+            new_conf_id = existing_by_name.get(base_name)
+            if new_conf_id is not None:
+                reused += 1
+                if selected_default_conf is not None:
+                    try:
+                        target_conf = _config_from_conf_id(new_conf_id)
+                        if target_conf is not None and callable(update_config):
+                            cloned = copy.deepcopy(selected_default_conf)
+                            if not isinstance(cloned, Mapping):
+                                raise RuntimeError("Invalid source preset payload")
+                            cloned = dict(cloned)
+                            cloned["id"] = int(new_conf_id)
+                            target_name = _field(target_conf, "name")
+                            if isinstance(target_name, str) and target_name:
+                                cloned["name"] = target_name
+                            else:
+                                cloned["name"] = base_name
+                            update_config(cloned)
+                            copied_settings += 1
+                    except Exception:
+                        settings_copy_failed += 1
+            else:
+                clone_from = selected_default_conf
+                if clone_from is None:
+                    for idx in valid_indexes:
+                        deck_id = deck_ids[idx]
+                        deck = mw.col.decks.get(deck_id)
+                        conf_id = _as_int(_field_any(deck, ("conf", "config_id")))
+                        if conf_id is None:
+                            continue
+                        conf = _config_from_conf_id(conf_id)
+                        if conf is not None:
+                            clone_from = conf
+                            break
 
-            clone_from = None
-            for idx in valid_indexes:
-                deck_id = deck_ids[idx]
-                deck = mw.col.decks.get(deck_id)
-                conf_id = _as_int(_field_any(deck, ("conf", "config_id")))
-                if conf_id is None:
+                try:
+                    if create_config_id is not None:
+                        new_conf_id = int(create_config_id(base_name, clone_from=clone_from))
+                    elif create_config is not None:
+                        new_conf = create_config(base_name, clone_from=clone_from)
+                        new_conf_id = _as_int(_field(new_conf, "id"))
+                        if new_conf_id is None:
+                            raise RuntimeError("Created preset has no id")
+                    else:
+                        raise RuntimeError("Preset creation API unavailable")
+                except Exception:
+                    failed += len(valid_indexes)
                     continue
-                conf = _config_from_conf_id(conf_id)
-                if conf is not None:
-                    clone_from = conf
-                    break
 
-            try:
-                if create_config_id is not None:
-                    new_conf_id = int(create_config_id(preset_name, clone_from=clone_from))
-                elif create_config is not None:
-                    new_conf = create_config(preset_name, clone_from=clone_from)
-                    new_conf_id = _as_int(_field(new_conf, "id"))
-                    if new_conf_id is None:
-                        raise RuntimeError("Created preset has no id")
-                else:
-                    raise RuntimeError("Preset creation API unavailable")
-            except Exception:
-                failed += len(valid_indexes)
-                continue
-
-            existing_names.append(preset_name)
-            created += 1
+                existing_by_name[base_name] = int(new_conf_id)
+                created += 1
+                if selected_default_conf is not None:
+                    copied_settings += 1
 
             for idx in valid_indexes:
                 target_by_deck[deck_ids[idx]] = int(new_conf_id)
@@ -1211,17 +1277,28 @@ def _show_similarity_groups(
         else:
             assigned = 0
 
-        if created == 0 and assigned == 0 and failed == 0:
-            showInfo("No recommended groups with at least 2 decks were found.")
+        if (
+            created == 0
+            and reused == 0
+            and copied_settings == 0
+            and assigned == 0
+            and failed == 0
+            and settings_copy_failed == 0
+        ):
+            showInfo("No recommended groups were found.")
             return
         if failed:
             showWarning(
-                f"Created {created} preset groups and reassigned {assigned} decks, "
-                f"with {failed} failures."
+                f"Created {created} groups, reused {reused} groups, "
+                f"copied settings on {copied_settings} groups, "
+                f"and reassigned {assigned} decks, "
+                f"with {failed} assignment failures and {settings_copy_failed} settings copy failures."
             )
         else:
             showInfo(
-                f"Created {created} preset groups and reassigned {assigned} decks.\n\n"
+                f"Created {created} groups, reused {reused} groups, "
+                f"copied settings on {copied_settings} groups, "
+                f"and reassigned {assigned} decks.\n\n"
                 "Reopen this window to refresh existing preset groups."
             )
         dialog.accept()
@@ -1368,18 +1445,31 @@ def _show_deck_computed_results() -> None:
         names=labels,
         distances=matrix,
         threshold=FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD,
+        min_group_size=1,
     )
 
-    _show_results_for_profiles(
-        profiles,
+    def _open_proximity_screen() -> None:
+        _show_results_for_profiles(
+            profiles,
+            title=_DECK_ACTION_LABEL,
+            item_label="Deck",
+            similar_profiles_by_id=similar_by_id,
+            similarity_groups=similarity_groups,
+            similarity_labels=labels,
+            similarity_deck_ids=ordered_deck_ids,
+            similarity_distances=matrix,
+            preset_groups=preset_groups,
+        )
+
+    _show_similarity_groups(
         title=_DECK_ACTION_LABEL,
         item_label="Deck",
-        similar_profiles_by_id=similar_by_id,
-        similarity_groups=similarity_groups,
-        similarity_labels=labels,
-        similarity_deck_ids=ordered_deck_ids,
-        similarity_distances=matrix,
+        groups=similarity_groups,
+        labels=labels,
+        deck_ids=ordered_deck_ids,
+        distances=matrix,
         preset_groups=preset_groups,
+        open_proximity_callback=_open_proximity_screen,
     )
 
 

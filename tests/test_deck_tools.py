@@ -157,6 +157,21 @@ def test_similarity_groups_from_matrix_excludes_boundary_and_singletons():
     assert similarity_groups_from_matrix(names=names, distances=distances, threshold=3.8) == []
 
 
+def test_similarity_groups_from_matrix_includes_singletons_when_requested():
+    names = ["A", "B", "C"]
+    distances = [
+        [0.0, 9.0, 9.0],
+        [9.0, 0.0, 9.0],
+        [9.0, 9.0, 0.0],
+    ]
+    assert similarity_groups_from_matrix(
+        names=names,
+        distances=distances,
+        threshold=3.8,
+        min_group_size=1,
+    ) == [["A"], ["B"], ["C"]]
+
+
 def test_grouped_names_by_label_sorts_labels_and_members():
     pairs = [
         ("Preset B", "Deck 2"),
