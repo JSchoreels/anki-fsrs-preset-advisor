@@ -38,9 +38,17 @@ from .analyzer import (
     is_fsrs6_valid_params,
     pairwise_distance_matrix,
 )
-from .tools.assignment_changes import (
-    changed_target_preset_ids_from_assignments,
-    deck_ids_grouped_by_target_preset,
+from .infra.decks_gateway import (
+    all_preset_configs as _all_preset_configs,
+    apply_preset_assignments as _apply_preset_assignments,
+    as_int as _as_int,
+    config_for_deck as _config_for_deck,
+    config_from_conf_id as _config_from_conf_id,
+    config_name as _config_name,
+    current_preset_assignments as _current_preset_assignments,
+    deck_entries as _deck_entries,
+    field as _field,
+    field_any as _field_any,
 )
 from .tools.cache import can_reuse_cached_params
 from .tools.deck_scope import descendant_deck_ids, leaf_deck_entries
@@ -58,6 +66,10 @@ from .tools.progress_messages import (
 )
 from .tools.relearning import count_relearning_steps_in_day
 from .tools.search_queries import build_deck_search_query, build_multi_deck_search_query
+from .use_cases.preset_reoptimization import (
+    changed_preset_deck_groups_for_reoptimization,
+    preset_optimization_summary_message,
+)
 from .reference_covariance import FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD
 
 _ACTION_LABEL = "FSRS Preset Proximity"
@@ -95,20 +107,6 @@ class _PaneScopedListWidget(QListWidget):
             super().dropEvent(event)
         else:
             event.ignore()
-
-
-def _deck_entries() -> list[tuple[int, str]]:
-    entries = []
-    for item in mw.col.decks.all_names_and_ids():
-        if isinstance(item, Mapping):
-            deck_id = int(item["id"])
-            name = str(item["name"])
-        else:
-            deck_id = int(getattr(item, "id"))
-            name = str(getattr(item, "name"))
-        entries.append((deck_id, name))
-    return entries
-
 
 def _legacy_cache_file_path() -> Path:
     return Path(__file__).resolve().parent / _CACHE_FILE_NAME
@@ -197,54 +195,6 @@ def _load_preset_backup() -> dict[int, int]:
         return entries
     return {}
 
-
-def _current_preset_assignments(deck_ids: Sequence[int]) -> dict[int, int]:
-    assignments: dict[int, int] = {}
-    for deck_id in deck_ids:
-        try:
-            deck = mw.col.decks.get(deck_id)
-        except Exception:
-            continue
-        conf_id = _as_int(_field_any(deck, ("conf", "config_id")))
-        if conf_id is not None:
-            assignments[int(deck_id)] = conf_id
-    return assignments
-
-
-def _apply_preset_assignments(assignments: Mapping[int, int]) -> tuple[int, int]:
-    changed = 0
-    failed = 0
-    setter = getattr(mw.col.decks, "set_config_id_for_deck_dict", None)
-    for deck_id, preset_id in assignments.items():
-        try:
-            deck = mw.col.decks.get(deck_id)
-            if not deck:
-                failed += 1
-                continue
-
-            current_preset = _as_int(_field_any(deck, ("conf", "config_id")))
-            if current_preset == preset_id:
-                continue
-
-            if setter is not None:
-                setter(deck, preset_id)
-            else:
-                if isinstance(deck, Mapping):
-                    deck["conf"] = preset_id
-                else:
-                    setattr(deck, "conf", preset_id)
-                mw.col.decks.save(deck)
-            changed += 1
-        except Exception:
-            failed += 1
-
-    try:
-        mw.reset()
-    except Exception:
-        pass
-    return changed, failed
-
-
 def _load_deck_param_cache() -> dict[str, dict[str, Any]]:
     preferred = _preferred_cache_file_path()
     for path in _cache_file_candidates():
@@ -307,131 +257,6 @@ def _review_count_for_deck_scope(
     )
     count = mw.col.db.scalar(sql, *scope_ids)
     return int(count or 0)
-
-
-def _as_int(value: Any) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return None
-
-
-def _field(obj: Any, name: str) -> Any:
-    if isinstance(obj, Mapping):
-        return obj.get(name)
-    return getattr(obj, name, None)
-
-
-def _field_any(obj: Any, names: Sequence[str]) -> Any:
-    for name in names:
-        value = _field(obj, name)
-        if value is not None:
-            return value
-    return None
-
-
-def _config_name(conf_id: int, config: Any) -> str:
-    name = _field(config, "name")
-    return str(name) if isinstance(name, str) and name else f"Preset {conf_id}"
-
-
-def _config_from_conf_id(conf_id: int) -> Any:
-    getter_names = ["get_config", "get_config_dict", "dconf_for_update_dict", "getconf"]
-    for getter_name in getter_names:
-        getter = getattr(mw.col.decks, getter_name, None)
-        if getter is None:
-            continue
-        try:
-            value = getter(conf_id)
-        except Exception:
-            continue
-        if value is not None:
-            return value
-    return None
-
-
-def _config_for_deck(deck_id: int) -> Any:
-    by_deck = getattr(mw.col.decks, "config_dict_for_deck_id", None)
-    if by_deck is not None:
-        try:
-            value = by_deck(deck_id)
-            if value is not None:
-                return value
-        except Exception:
-            pass
-
-    deck = mw.col.decks.get(deck_id)
-    conf_id = _field_any(deck, ("conf", "config_id"))
-    if isinstance(conf_id, int):
-        return _config_from_conf_id(conf_id)
-
-    return None
-
-
-def _normalize_config(config: Any, fallback_id: Any = None) -> tuple[int, str, Any] | None:
-    conf_id = _as_int(_field(config, "id"))
-    if conf_id is None:
-        conf_id = _as_int(fallback_id)
-    if conf_id is None:
-        return None
-    conf_name = _config_name(conf_id, config)
-    return conf_id, conf_name, config
-
-
-def _all_preset_configs() -> list[tuple[int, str, Any]]:
-    seen: dict[int, tuple[str, Any]] = {}
-
-    getter_names = (
-        "all_config",
-        "all_configs",
-        "all_config_dict",
-        "all_config_dicts",
-        "all_confs",
-    )
-    for getter_name in getter_names:
-        getter = getattr(mw.col.decks, getter_name, None)
-        if getter is None:
-            continue
-        try:
-            raw = getter()
-        except Exception:
-            continue
-
-        if isinstance(raw, Mapping):
-            entries = list(raw.items())
-        elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
-            entries = [(None, config) for config in raw]
-        else:
-            continue
-
-        for key, config in entries:
-            normalized = _normalize_config(config, fallback_id=key)
-            if normalized is None:
-                continue
-            conf_id, conf_name, conf_obj = normalized
-            seen[conf_id] = (conf_name, conf_obj)
-
-    if seen:
-        return sorted((conf_id, item[0], item[1]) for conf_id, item in seen.items())
-
-    # Fallback for older API shapes: gather presets referenced by decks.
-    for deck_id, _ in _deck_entries():
-        deck = mw.col.decks.get(deck_id)
-        conf_id = _as_int(_field_any(deck, ("conf", "config_id")))
-        if conf_id is None:
-            continue
-        if conf_id in seen:
-            continue
-
-        config = _config_from_conf_id(conf_id)
-        if config is None:
-            continue
-        name = _config_name(conf_id, config)
-        seen[conf_id] = (name, config)
-
-    return sorted((conf_id, item[0], item[1]) for conf_id, item in seen.items())
-
 
 def _load_profiles() -> list[FSRSProfile]:
     profiles: list[FSRSProfile] = []
@@ -1497,17 +1322,14 @@ def _show_similarity_groups(
             )
 
         after_target_assignments = _current_preset_assignments(list(target_by_deck.keys()))
-        changed_recommended_conf_ids = changed_target_preset_ids_from_assignments(
-            before_assignments=before_assignments,
-            after_assignments=after_target_assignments,
-            target_by_deck=target_by_deck,
-            candidate_preset_ids=recommended_conf_ids,
-        )
         all_deck_ids = [deck_id for deck_id, _deck_name in _deck_entries()]
         all_current_assignments = _current_preset_assignments(all_deck_ids)
-        changed_preset_deck_groups = deck_ids_grouped_by_target_preset(
-            target_by_deck=all_current_assignments,
-            preset_ids=changed_recommended_conf_ids,
+        changed_preset_deck_groups = changed_preset_deck_groups_for_reoptimization(
+            before_assignments=before_assignments,
+            after_target_assignments=after_target_assignments,
+            target_by_deck=target_by_deck,
+            candidate_preset_ids=recommended_conf_ids,
+            all_current_assignments=all_current_assignments,
         )
         if changed_preset_deck_groups:
             optimize_choice = QMessageBox.question(
@@ -1521,15 +1343,13 @@ def _show_similarity_groups(
                 optimized, no_data, invalid_params, optimization_failed, cancelled = (
                     _optimize_preset_configs(changed_preset_deck_groups)
                 )
-                lines = [
-                    f"Optimized presets: {optimized}",
-                    f"Skipped (no FSRS items): {no_data}",
-                    f"Skipped (non-FSRS6 params): {invalid_params}",
-                    f"Failed: {optimization_failed}",
-                ]
-                if cancelled:
-                    lines.append("Cancelled before completion.")
-                message = "Preset optimization summary:\n" + "\n".join(lines)
+                message = preset_optimization_summary_message(
+                    optimized=optimized,
+                    no_data=no_data,
+                    invalid_params=invalid_params,
+                    failed=optimization_failed,
+                    cancelled=cancelled,
+                )
                 if optimization_failed:
                     showWarning(message)
                 else:
