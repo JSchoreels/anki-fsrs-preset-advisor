@@ -1,6 +1,6 @@
 {
-    "name": "FSRS Preset Merger Splitter",
-    "package": "anki-fsrs-preset-merger-splitter",
+    "name": "FSRS Preset Advisor",
+    "package": "anki-fsrs-preset-advisor",
     "ankiweb_id": "",
     "author": "",
     "version": "0.1.0",

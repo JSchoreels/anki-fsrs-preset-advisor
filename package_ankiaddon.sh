@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ADDON_NAME="anki-fsrs-preset-merger-splitter"
+ADDON_NAME="anki-fsrs-preset-advisor"
 OUT_FILE="${1:-$ROOT_DIR/dist/${ADDON_NAME}.ankiaddon}"
 
 if ! command -v zip >/dev/null 2>&1; then

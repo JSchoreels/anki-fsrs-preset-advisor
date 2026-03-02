@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET_DIR="/Users/jschoreels/Library/Application Support/Anki2/addons21/anki-fsrs-preset-merger-splitter"
+TARGET_DIR="/Users/jschoreels/Library/Application Support/Anki2/addons21/anki-fsrs-preset-advisor"
 
 mkdir -p "$TARGET_DIR"
 

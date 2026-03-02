@@ -22,6 +22,7 @@ from aqt.qt import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     Qt,
@@ -721,15 +722,26 @@ def _show_results_for_profiles(
     table.resizeColumnsToContents()
     layout.addWidget(table)
 
-    matrix_button = QPushButton("Show All Distances", dialog)
-    matrix_button.clicked.connect(
-        lambda: _show_pairwise_distances(
-            profiles,
-            title=title,
-            empty_message=f"No {item_label.lower()}s with FSRS parameters are available.",
-        )
-    )
-    layout.addWidget(matrix_button)
+    matrix_title = QLabel("Proximity Matrix", dialog)
+    layout.addWidget(matrix_title)
+
+    ordered_profiles, distances = pairwise_distance_matrix(profiles)
+    matrix_table = QTableWidget(len(ordered_profiles), len(ordered_profiles), dialog)
+    matrix_labels = [profile.profile_name for profile in ordered_profiles]
+    matrix_table.setHorizontalHeaderLabels(matrix_labels)
+    for row_idx, row_profile in enumerate(ordered_profiles):
+        matrix_table.setVerticalHeaderItem(row_idx, QTableWidgetItem(row_profile.profile_name))
+        for col_idx, col_profile in enumerate(ordered_profiles):
+            if not is_fsrs6_valid_params(row_profile.weights) or not is_fsrs6_valid_params(
+                col_profile.weights
+            ):
+                display = "Not FSRS6 valid params"
+            else:
+                value = distances[row_idx][col_idx]
+                display = "-" if value is None else f"{value:.4f}"
+            matrix_table.setItem(row_idx, col_idx, QTableWidgetItem(display))
+    matrix_table.resizeColumnsToContents()
+    layout.addWidget(matrix_table)
 
     if (
         similarity_groups is not None
@@ -751,7 +763,7 @@ def _show_results_for_profiles(
         )
         layout.addWidget(groups_button)
 
-    dialog.resize(1200, 500)
+    dialog.resize(1300, 900)
     dialog.exec()
 
 
@@ -784,19 +796,36 @@ def _show_similarity_groups(
 
     dialog.finished.connect(_mark_dialog_closed)
 
-    summary = QLabel(
-        f"{len(groups)} groups found (pairwise {item_label.lower()} distance < "
-        f"{FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD:.1f})",
-        dialog,
-    )
+    name_to_index = {name: idx for idx, name in enumerate(labels)}
+    current_threshold = float(FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD)
+
+    def _recommended_groups_from_threshold(threshold: float) -> list[list[int]]:
+        grouped_names = similarity_groups_from_matrix(
+            names=labels,
+            distances=distances,
+            threshold=threshold,
+            min_group_size=1,
+        )
+        return [[name_to_index[name] for name in group if name in name_to_index] for group in grouped_names]
+
+    recommended_group_indexes = _recommended_groups_from_threshold(current_threshold)
+
+    summary = QLabel(dialog)
     layout.addWidget(summary)
 
-    name_to_index = {name: idx for idx, name in enumerate(labels)}
-    group_indexes: list[list[int]] = [
-        [name_to_index[name] for name in group if name in name_to_index]
-        for group in groups
-    ]
-    initial_group_indexes = [list(group) for group in group_indexes]
+    threshold_layout = QHBoxLayout()
+    threshold_layout.addWidget(QLabel("Grouping Threshold:", dialog))
+    orientation_enum = getattr(Qt, "Orientation", None)
+    horizontal = orientation_enum.Horizontal if orientation_enum is not None else Qt.Horizontal
+    threshold_slider = QSlider(horizontal, dialog)
+    threshold_slider.setMinimum(1)
+    threshold_slider.setMaximum(100)
+    threshold_slider.setSingleStep(1)
+    threshold_slider.setValue(int(round(current_threshold * 10)))
+    threshold_layout.addWidget(threshold_slider)
+    threshold_value_label = QLabel(dialog)
+    threshold_layout.addWidget(threshold_value_label)
+    layout.addLayout(threshold_layout)
     item_data_role = getattr(Qt, "ItemDataRole", None)
     user_role = item_data_role.UserRole if item_data_role is not None else Qt.UserRole
     drop_action = getattr(Qt, "DropAction", None)
@@ -820,9 +849,9 @@ def _show_similarity_groups(
     def _metric_text_and_color(value: float | None) -> tuple[str, str]:
         if value is None:
             return "n/a", neutral
-        if value < FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD:
+        if value < current_threshold:
             return f"{value:.4f}", green
-        if value > FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD:
+        if value > current_threshold:
             return f"{value:.4f}", red
         return f"{value:.4f}", neutral
 
@@ -902,25 +931,6 @@ def _show_similarity_groups(
     container_layout.addWidget(right_header)
     group_widgets: list[tuple[int, QGroupBox, QLabel, QListWidget]] = []
 
-    for idx, group in enumerate(group_indexes):
-        group_box = QGroupBox(f"Group {idx + 1}", container)
-        group_layout = QVBoxLayout(group_box)
-        stats_label = QLabel(group_box)
-        group_layout.addWidget(stats_label)
-        list_widget = _PaneScopedListWidget("right", group_box)
-        list_widget.setSelectionMode(selection_mode)
-        list_widget.setDragEnabled(True)
-        list_widget.setAcceptDrops(True)
-        list_widget.setDropIndicatorShown(True)
-        list_widget.setDragDropMode(drag_drop_mode)
-        list_widget.setDefaultDropAction(move_action)
-        for deck_idx in group:
-            item = QListWidgetItem(list_widget)
-            item.setData(user_role, deck_idx)
-        group_layout.addWidget(list_widget)
-        container_layout.addWidget(group_box)
-        group_widgets.append((idx + 1, group_box, stats_label, list_widget))
-
     def _populate_list_widget(list_widget: QListWidget, indexes: Sequence[int]) -> None:
         if dialog_closed:
             return
@@ -944,6 +954,14 @@ def _show_similarity_groups(
         for group_idx, (_, _, _, _, list_widget) in enumerate(preset_widgets):
             indexes = index_groups[group_idx] if group_idx < len(index_groups) else ()
             _populate_list_widget(list_widget, indexes)
+
+    def _update_summary() -> None:
+        if dialog_closed:
+            return
+        summary.setText(
+            f"{len(recommended_group_indexes)} groups found "
+            f"(pairwise {item_label.lower()} distance < {current_threshold:.1f})"
+        )
 
     def _refresh_similarity_views() -> None:
         if dialog_closed:
@@ -1041,20 +1059,16 @@ def _show_similarity_groups(
                 except RuntimeError:
                     continue
 
-    for _, _, _, list_widget in group_widgets:
-        model = list_widget.model()
-        model.rowsInserted.connect(lambda *_args: _refresh_similarity_views())
-        model.rowsRemoved.connect(lambda *_args: _refresh_similarity_views())
-        model.modelReset.connect(lambda *_args: _refresh_similarity_views())
-
     for _, _, _, _, list_widget in preset_widgets:
         model = list_widget.model()
         model.rowsInserted.connect(lambda *_args: _refresh_preset_views())
         model.rowsRemoved.connect(lambda *_args: _refresh_preset_views())
         model.modelReset.connect(lambda *_args: _refresh_preset_views())
 
-    all_list_widgets = [row[3] for row in group_widgets] + [row[4] for row in preset_widgets]
     selection_syncing = False
+
+    def _all_list_widgets() -> list[QListWidget]:
+        return [row[3] for row in group_widgets] + [row[4] for row in preset_widgets]
 
     def _find_item_by_deck_index(list_widget: QListWidget, deck_idx: int) -> QListWidgetItem | None:
         try:
@@ -1082,12 +1096,12 @@ def _show_similarity_groups(
             return
         selection_syncing = True
         try:
-            for list_widget in all_list_widgets:
+            for list_widget in _all_list_widgets():
                 try:
                     list_widget.blockSignals(True)
                 except RuntimeError:
                     continue
-            for list_widget in all_list_widgets:
+            for list_widget in _all_list_widgets():
                 try:
                     list_widget.clearSelection()
                 except RuntimeError:
@@ -1101,7 +1115,7 @@ def _show_similarity_groups(
                 except RuntimeError:
                     continue
         finally:
-            for list_widget in all_list_widgets:
+            for list_widget in _all_list_widgets():
                 try:
                     list_widget.blockSignals(False)
                 except RuntimeError:
@@ -1120,8 +1134,58 @@ def _show_similarity_groups(
             return
         _sync_selection(deck_idx)
 
-    for list_widget in all_list_widgets:
+    for _, _, _, _, list_widget in preset_widgets:
         list_widget.itemClicked.connect(_sync_selection_from_item)
+
+    def _clear_similarity_widgets() -> None:
+        nonlocal group_widgets
+        for _, group_box, _, _ in group_widgets:
+            try:
+                container_layout.removeWidget(group_box)
+                group_box.deleteLater()
+            except RuntimeError:
+                continue
+        group_widgets = []
+
+    def _rebuild_similarity_widgets(index_groups: Sequence[Sequence[int]]) -> None:
+        _clear_similarity_widgets()
+        for idx, group in enumerate(index_groups):
+            group_box = QGroupBox(f"Group {idx + 1}", container)
+            group_layout = QVBoxLayout(group_box)
+            stats_label = QLabel(group_box)
+            group_layout.addWidget(stats_label)
+            list_widget = _PaneScopedListWidget("right", group_box)
+            list_widget.setSelectionMode(selection_mode)
+            list_widget.setDragEnabled(True)
+            list_widget.setAcceptDrops(True)
+            list_widget.setDropIndicatorShown(True)
+            list_widget.setDragDropMode(drag_drop_mode)
+            list_widget.setDefaultDropAction(move_action)
+            for deck_idx in group:
+                item = QListWidgetItem(list_widget)
+                item.setData(user_role, deck_idx)
+            group_layout.addWidget(list_widget)
+            container_layout.addWidget(group_box)
+            group_widgets.append((idx + 1, group_box, stats_label, list_widget))
+
+            model = list_widget.model()
+            model.rowsInserted.connect(lambda *_args: _refresh_similarity_views())
+            model.rowsRemoved.connect(lambda *_args: _refresh_similarity_views())
+            model.modelReset.connect(lambda *_args: _refresh_similarity_views())
+            list_widget.itemClicked.connect(_sync_selection_from_item)
+
+    def _on_threshold_changed(raw_value: int) -> None:
+        nonlocal current_threshold, recommended_group_indexes
+        current_threshold = float(raw_value) / 10.0
+        threshold_value_label.setText(f"{current_threshold:.1f}")
+        recommended_group_indexes = _recommended_groups_from_threshold(current_threshold)
+        _rebuild_similarity_widgets(recommended_group_indexes)
+        _update_summary()
+        _refresh_similarity_views()
+        _refresh_preset_views()
+
+    threshold_slider.valueChanged.connect(_on_threshold_changed)
+    _on_threshold_changed(threshold_slider.value())
 
     right_scroll.setWidget(container)
     split_layout.addWidget(right_scroll)
@@ -1145,7 +1209,7 @@ def _show_similarity_groups(
     reset_button = QPushButton("Reset Groups", dialog)
     reset_button.clicked.connect(
         lambda: (
-            _populate_group_widgets(initial_group_indexes),
+            _populate_group_widgets(recommended_group_indexes),
             _populate_preset_widgets(initial_preset_indexes),
             _refresh_similarity_views(),
             _refresh_preset_views(),
@@ -1207,7 +1271,7 @@ def _show_similarity_groups(
         failed = 0
         target_by_deck: dict[int, int] = {}
 
-        for group_number, indexes in enumerate(initial_group_indexes, start=1):
+        for group_number, indexes in enumerate(recommended_group_indexes, start=1):
             valid_indexes = [idx for idx in indexes if 0 <= idx < len(deck_ids)]
             if len(valid_indexes) < 1:
                 continue
