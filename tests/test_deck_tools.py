@@ -6,13 +6,18 @@ from fsrs_merge_advisor.deck_tools import (
     count_relearning_steps_in_day,
     deck_ids_grouped_by_target_preset,
     descendant_deck_ids,
+    fsrs_version_for_config_payload,
     grouped_names_by_label,
+    include_same_day_reviews_for_optimize_from_config_payload,
+    is_supported_fsrs_params,
     leaf_deck_entries,
     max_distance_to_group_for_item,
     max_pairwise_distance_for_group,
     optimization_progress_message,
     preset_optimization_progress_message,
     recommended_group_preset_name,
+    reset_fsrs_search_filters_on_config_payload,
+    selected_fsrs_params_from_config_payload,
     set_fsrs_params_on_config_payload,
     similar_items_below_threshold,
     similarity_groups_from_matrix,
@@ -271,6 +276,200 @@ def test_set_fsrs_params_on_config_payload_falls_back_to_fsrs_params6():
     payload = {"id": 1, "name": "Preset A"}
     updated = set_fsrs_params_on_config_payload(config_payload=payload, params=[5.0, 6.0])
     assert updated["fsrsParams6"] == [5.0, 6.0]
+
+
+def test_set_fsrs_params_on_config_payload_updates_fsrs7_without_overwriting_fsrs6():
+    payload = {
+        "id": 1,
+        "name": "Preset A",
+        "fsrsVersion": 0,
+        "fsrsParams6": [1.0] * 21,
+        "fsrsParams7": [2.0] * 35,
+    }
+    updated = set_fsrs_params_on_config_payload(
+        config_payload=payload,
+        params=[3.0] * 35,
+    )
+    assert updated["fsrsVersion"] == 0
+    assert updated["fsrsParams6"] == [1.0] * 21
+    assert updated["fsrsParams7"] == [3.0] * 35
+
+
+def test_set_fsrs_params_on_config_payload_updates_final_fsrs7_without_overwriting_fsrs6():
+    payload = {
+        "id": 1,
+        "name": "Preset A",
+        "fsrsVersion": 0,
+        "fsrsParams6": [1.0] * 21,
+        "fsrsParams7": [2.0] * 35,
+    }
+    updated = set_fsrs_params_on_config_payload(
+        config_payload=payload,
+        params=[3.0] * 34,
+    )
+    assert updated["fsrsVersion"] == 0
+    assert updated["fsrsParams6"] == [1.0] * 21
+    assert updated["fsrsParams7"] == [3.0] * 34
+
+
+def test_selected_fsrs_params_from_config_payload_uses_selected_version():
+    assert selected_fsrs_params_from_config_payload(
+        {
+            "fsrsVersion": 0,
+            "fsrsParams6": [1.0] * 21,
+            "fsrsParams7": [2.0] * 35,
+        }
+    ) == tuple([2.0] * 35)
+    assert selected_fsrs_params_from_config_payload(
+        {
+            "fsrs_version": 1,
+            "fsrs_params6": [4.0] * 21,
+            "fsrs_params7": [5.0] * 35,
+        }
+    ) == tuple([4.0] * 21)
+
+
+def test_fsrs_version_for_config_payload_accepts_proto_enum_strings():
+    assert fsrs_version_for_config_payload({"fsrsVersion": "FSRS_VERSION_SEVEN"}) == 0
+    assert fsrs_version_for_config_payload({"fsrs_version": "FSRS_VERSION_SIX"}) == 1
+
+
+def test_include_same_day_reviews_for_optimize_reads_fsrs7_aux_data():
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsVersion": 0,
+                "other": {"fsrs7IncludeSameDayOptimize": False},
+            }
+        )
+        is False
+    )
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsVersion": 0,
+                "other": '{"fsrs7IncludeSameDayOptimize": false}',
+            }
+        )
+        is False
+    )
+
+
+def test_include_same_day_reviews_for_optimize_reads_nested_config_aux_data():
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "config": {
+                    "fsrsVersion": 0,
+                    "other": b'{"fsrs7IncludeSameDayOptimize":false}',
+                }
+            }
+        )
+        is False
+    )
+
+
+def test_include_same_day_reviews_for_optimize_accepts_final_fsrs7_params_without_version():
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsParams7": [1.0] * 34,
+                "other": {"fsrs7IncludeSameDayOptimize": False},
+            }
+        )
+        is False
+    )
+
+
+def test_include_same_day_reviews_for_optimize_accepts_legacy_preview_fsrs7_params_without_version():
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsParams7": [1.0] * 35,
+                "other": {"fsrs7IncludeSameDayOptimize": False},
+            }
+        )
+        is False
+    )
+
+
+def test_include_same_day_reviews_for_optimize_reads_byte_sequence_aux_data():
+    encoded = list(b'{"fsrs7IncludeSameDayOptimize":false}')
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsVersion": 0,
+                "other": encoded,
+            }
+        )
+        is False
+    )
+
+
+def test_include_same_day_reviews_for_optimize_defaults_true_for_fsrs7():
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsVersion": 0,
+                "other": {},
+            }
+        )
+        is True
+    )
+
+
+def test_include_same_day_reviews_for_optimize_omits_non_fsrs7_configs():
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {
+                "fsrsVersion": 1,
+                "other": {"fsrs7IncludeSameDayOptimize": False},
+            }
+        )
+        is None
+    )
+    assert (
+        include_same_day_reviews_for_optimize_from_config_payload(
+            {"other": {"fsrs7IncludeSameDayOptimize": False}}
+        )
+        is None
+    )
+
+
+def test_reset_fsrs_search_filters_on_config_payload_resets_optimize_and_evaluate_filters():
+    payload = {
+        "id": 1,
+        "name": "Preset",
+        "paramSearch": 'preset:"Parent"',
+        "other": {"fsrsEvaluationSearch": 'preset:"Parent" is:review', "untouched": 1},
+    }
+
+    updated = reset_fsrs_search_filters_on_config_payload(payload)
+
+    assert updated["paramSearch"] == ""
+    assert updated["other"] == {"fsrsEvaluationSearch": "", "untouched": 1}
+    assert payload["paramSearch"] == 'preset:"Parent"'
+    assert payload["other"]["fsrsEvaluationSearch"] == 'preset:"Parent" is:review'
+
+
+def test_reset_fsrs_search_filters_on_config_payload_preserves_serialized_aux_data_shape():
+    updated = reset_fsrs_search_filters_on_config_payload(
+        {
+            "id": 1,
+            "param_search": 'preset:"Parent"',
+            "other": '{"fsrsEvaluationSearch":"preset:\\"Parent\\"","untouched":1}',
+        }
+    )
+
+    assert updated["param_search"] == ""
+    assert updated["other"] == '{"fsrsEvaluationSearch":"","untouched":1}'
+
+
+def test_is_supported_fsrs_params_accepts_fsrs6_and_fsrs7():
+    assert is_supported_fsrs_params([1.0] * 21) is True
+    assert is_supported_fsrs_params([1.0] * 34) is True
+    assert is_supported_fsrs_params([1.0] * 35) is True
+    assert is_supported_fsrs_params([1.0] * 20) is False
 
 
 def test_max_pairwise_distance_for_group():

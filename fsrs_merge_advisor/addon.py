@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import copy
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,7 +55,14 @@ from .infra.decks_gateway import (
 )
 from .tools.cache import can_reuse_cached_params
 from .tools.deck_scope import descendant_deck_ids, leaf_deck_entries
-from .tools.fsrs_payload import set_fsrs_params_on_config_payload
+from .tools.fsrs_payload import (
+    fsrs_version_for_config_payload,
+    include_same_day_reviews_for_optimize_from_config_payload,
+    is_supported_fsrs_params,
+    reset_fsrs_search_filters_on_config_payload,
+    selected_fsrs_params_from_config_payload,
+    set_fsrs_params_on_config_payload,
+)
 from .tools.grouping import (
     max_distance_to_group_for_item,
     max_pairwise_distance_for_group,
@@ -79,7 +88,10 @@ from .use_cases.first_review_split import (
     target_deck_names_for_first_review_split,
     target_preset_names_for_first_review_split,
 )
-from .use_cases.preset_cleanup import empty_advisor_preset_candidates
+from .use_cases.preset_cleanup import (
+    empty_advisor_preset_candidates,
+    unused_advisor_preset_candidates_by_name,
+)
 from .use_cases.evaluate_mergeability import (
     align_group_indexes_by_overlap,
     can_reuse_evaluate_cached_logloss,
@@ -99,6 +111,8 @@ _CLEAN_EMPTY_PRESETS_LABEL = "FSRS Cleanup Empty Advisor Presets"
 _CACHE_FILE_NAME = "deck_params_cache.json"
 _PRESET_BACKUP_FILE_NAME = "deck_preset_backup.json"
 _EVALUATE_LOGLOSS_CACHE_FILE_NAME = "evaluate_logloss_cache.json"
+_LOG_FILE_NAME = "fsrs_preset_advisor.log"
+_LOGGER_NAME = "fsrs_preset_advisor"
 
 
 class _PaneScopedListWidget(QListWidget):
@@ -131,21 +145,96 @@ class _PaneScopedListWidget(QListWidget):
         else:
             event.ignore()
 
-def _legacy_cache_file_path() -> Path:
-    return Path(__file__).resolve().parent / _CACHE_FILE_NAME
 
-
-def _preferred_cache_file_path() -> Path:
+def _profile_path_or_legacy_file(file_name: str) -> Path:
     pm = getattr(mw, "pm", None)
     profile_folder_getter = getattr(pm, "profileFolder", None)
     if callable(profile_folder_getter):
         try:
             profile_folder = profile_folder_getter()
             if isinstance(profile_folder, str) and profile_folder:
-                return Path(profile_folder) / _CACHE_FILE_NAME
+                return Path(profile_folder) / file_name
         except Exception:
             pass
-    return _legacy_cache_file_path()
+    return Path(__file__).resolve().parent / file_name
+
+
+def _log_file_path() -> Path:
+    return _profile_path_or_legacy_file(_LOG_FILE_NAME)
+
+
+def _logger() -> logging.Logger:
+    logger = logging.getLogger(_LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    path = _log_file_path()
+    configured_path = getattr(logger, "_fsrs_advisor_log_path", None)
+    if configured_path == str(path) and logger.handlers:
+        return logger
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        logger.addHandler(handler)
+        setattr(logger, "_fsrs_advisor_log_path", str(path))
+    except Exception:
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+
+def _log_debug(message: str, *args: Any) -> None:
+    try:
+        _logger().debug(message, *args)
+    except Exception:
+        pass
+
+
+def _log_info(message: str, *args: Any) -> None:
+    try:
+        _logger().info(message, *args)
+    except Exception:
+        pass
+
+
+def _log_warning(message: str, *args: Any) -> None:
+    try:
+        _logger().warning(message, *args)
+    except Exception:
+        pass
+
+
+def _log_exception(message: str, *args: Any) -> None:
+    try:
+        _logger().exception(message, *args)
+    except Exception:
+        pass
+
+
+def _reset_ui_after_collection_change(reason: str) -> None:
+    try:
+        mw.reset()
+        _log_info("requested Anki UI reset after %s", reason)
+    except Exception:
+        _log_exception("failed to request Anki UI reset after %s", reason)
+
+def _legacy_cache_file_path() -> Path:
+    return Path(__file__).resolve().parent / _CACHE_FILE_NAME
+
+
+def _preferred_cache_file_path() -> Path:
+    return _profile_path_or_legacy_file(_CACHE_FILE_NAME)
 
 
 def _cache_file_candidates() -> list[Path]:
@@ -161,16 +250,7 @@ def _legacy_evaluate_logloss_cache_file_path() -> Path:
 
 
 def _preferred_evaluate_logloss_cache_file_path() -> Path:
-    pm = getattr(mw, "pm", None)
-    profile_folder_getter = getattr(pm, "profileFolder", None)
-    if callable(profile_folder_getter):
-        try:
-            profile_folder = profile_folder_getter()
-            if isinstance(profile_folder, str) and profile_folder:
-                return Path(profile_folder) / _EVALUATE_LOGLOSS_CACHE_FILE_NAME
-        except Exception:
-            pass
-    return _legacy_evaluate_logloss_cache_file_path()
+    return _profile_path_or_legacy_file(_EVALUATE_LOGLOSS_CACHE_FILE_NAME)
 
 
 def _evaluate_logloss_cache_file_candidates() -> list[Path]:
@@ -186,16 +266,7 @@ def _legacy_preset_backup_file_path() -> Path:
 
 
 def _preferred_preset_backup_file_path() -> Path:
-    pm = getattr(mw, "pm", None)
-    profile_folder_getter = getattr(pm, "profileFolder", None)
-    if callable(profile_folder_getter):
-        try:
-            profile_folder = profile_folder_getter()
-            if isinstance(profile_folder, str) and profile_folder:
-                return Path(profile_folder) / _PRESET_BACKUP_FILE_NAME
-        except Exception:
-            pass
-    return _legacy_preset_backup_file_path()
+    return _profile_path_or_legacy_file(_PRESET_BACKUP_FILE_NAME)
 
 
 def _preset_backup_file_candidates() -> list[Path]:
@@ -435,8 +506,20 @@ def _card_ids_for_decks(deck_ids: Sequence[int]) -> list[int]:
 
 
 def _deck_exists(deck_id: int) -> bool:
+    deck_manager = getattr(mw.col, "decks", None)
+    if deck_manager is None:
+        return False
+    get_deck = getattr(deck_manager, "get", None)
+    if not callable(get_deck):
+        return False
     try:
-        return mw.col.decks.get(int(deck_id)) is not None
+        return get_deck(int(deck_id), default=False) is not None
+    except TypeError:
+        try:
+            deck = get_deck(int(deck_id))
+        except Exception:
+            return False
+        return _as_int(_field(deck, "id")) == int(deck_id)
     except Exception:
         return False
 
@@ -449,13 +532,7 @@ def _delete_deck_by_id(deck_id: int) -> bool:
         return False
 
     method_calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = [
-        ("remove", ([int(deck_id)],), {"cards_too": False}),
-        ("remove", ([int(deck_id)],), {"cardsToo": False}),
-        ("remove", ([int(deck_id)], False), {}),
-        ("remove", ([int(deck_id)], False, True), {}),
-        ("rem", ([int(deck_id)],), {"cardsToo": False, "childrenToo": True}),
-        ("rem", ([int(deck_id)], False, True), {}),
-        ("rem", ([int(deck_id)], False), {}),
+        ("remove", ([int(deck_id)],), {}),
     ]
 
     for method_name, args, kwargs in method_calls:
@@ -621,11 +698,50 @@ def _num_relearning_steps_in_day_for_deck(deck_id: int) -> int:
     return count_relearning_steps_in_day(steps)
 
 
+def _compute_fsrs_params_request_message(
+    *,
+    search: str,
+    current_params: Sequence[float],
+    num_of_relearning_steps: int,
+    fsrs_version: int | None,
+    include_same_day_reviews: bool | None,
+) -> Any | None:
+    try:
+        from anki import scheduler_pb2
+    except Exception:
+        return None
+
+    request_cls = getattr(scheduler_pb2, "ComputeFsrsParamsRequest", None)
+    if request_cls is None:
+        return None
+
+    try:
+        request = request_cls()
+        request.search = search
+        request.current_params.extend(float(value) for value in current_params)
+        request.ignore_revlogs_before_ms = 0
+        request.num_of_relearning_steps = int(num_of_relearning_steps)
+        if hasattr(request, "health_check"):
+            request.health_check = False
+        if include_same_day_reviews is not None and hasattr(
+            request, "include_same_day_reviews"
+        ):
+            request.include_same_day_reviews = bool(include_same_day_reviews)
+        if fsrs_version is not None and hasattr(request, "fsrs_version"):
+            request.fsrs_version = int(fsrs_version)
+        return request
+    except Exception:
+        _log_exception("failed to build ComputeFsrsParamsRequest message")
+        return None
+
+
 def _compute_fsrs_params_for_deck(
     *,
     search: str,
     current_params: tuple[float, ...],
     num_of_relearning_steps: int,
+    fsrs_version: int | None = None,
+    include_same_day_reviews: bool | None = None,
 ) -> tuple[tuple[float, ...], int]:
     backend = getattr(mw.col, "_backend", None)
     compute = getattr(backend, "compute_fsrs_params", None)
@@ -637,33 +753,100 @@ def _compute_fsrs_params_for_deck(
         "ignore_revlogs_before_ms": 0,
         "health_check": False,
     }
-    candidates = [
-        {
-            **base_kwargs,
-            "current_params": list(current_params),
-            "num_of_relearning_steps": num_of_relearning_steps,
-        },
-        {
-            "search": base_kwargs["search"],
-            "ignoreRevlogsBeforeMs": 0,
-            "healthCheck": False,
-            "currentParams": list(current_params),
-            "numOfRelearningSteps": num_of_relearning_steps,
-        },
-    ]
+    snake_kwargs = {
+        **base_kwargs,
+        "current_params": list(current_params),
+        "num_of_relearning_steps": num_of_relearning_steps,
+    }
+    if fsrs_version is not None:
+        snake_kwargs["fsrs_version"] = int(fsrs_version)
+    if include_same_day_reviews is not None:
+        snake_kwargs["include_same_day_reviews"] = bool(include_same_day_reviews)
+    camel_kwargs = {
+        "search": base_kwargs["search"],
+        "ignoreRevlogsBeforeMs": 0,
+        "healthCheck": False,
+        "currentParams": list(current_params),
+        "numOfRelearningSteps": num_of_relearning_steps,
+    }
+    if fsrs_version is not None:
+        camel_kwargs["fsrsVersion"] = int(fsrs_version)
+    if include_same_day_reviews is not None:
+        camel_kwargs["includeSameDayReviews"] = bool(include_same_day_reviews)
+    candidates: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    request = _compute_fsrs_params_request_message(
+        search=search,
+        current_params=current_params,
+        num_of_relearning_steps=num_of_relearning_steps,
+        fsrs_version=fsrs_version,
+        include_same_day_reviews=include_same_day_reviews,
+    )
+    if request is not None:
+        candidates.append(("message", (request,), {}))
+    candidates.extend(
+        [
+            ("kwargs", (), snake_kwargs),
+            (
+                "kwargs-no-same-day",
+                (),
+                {
+                    key: value
+                    for key, value in snake_kwargs.items()
+                    if key != "include_same_day_reviews"
+                },
+            ),
+            (
+                "kwargs-no-newer-fields",
+                (),
+                {
+                    key: value
+                    for key, value in snake_kwargs.items()
+                    if key not in {"fsrs_version", "include_same_day_reviews"}
+                },
+            ),
+            ("camel-kwargs", (), camel_kwargs),
+        ]
+    )
 
     response = None
     last_type_error: Exception | None = None
-    for kwargs in candidates:
+    for index, (shape, args, kwargs) in enumerate(candidates, start=1):
+        _log_info(
+            "compute_fsrs_params attempt=%s search_length=%s current_param_count=%s "
+            "relearning_steps=%s fsrs_version=%s include_same_day_reviews=%s "
+            "shape=%s keys=%s",
+            index,
+            len(search),
+            len(current_params),
+            num_of_relearning_steps,
+            fsrs_version,
+            include_same_day_reviews,
+            shape,
+            sorted(kwargs.keys()),
+        )
         try:
-            response = compute(**kwargs)
+            response = compute(*args, **kwargs)
+            _log_info("compute_fsrs_params attempt=%s succeeded", index)
             break
         except TypeError as exc:
             last_type_error = exc
+            _log_info(
+                "compute_fsrs_params attempt=%s shape=%s rejected arguments: %s",
+                index,
+                shape,
+                exc,
+            )
             continue
+        except Exception:
+            _log_exception("compute_fsrs_params attempt=%s failed", index)
+            raise
 
     if response is None:
         if last_type_error is not None:
+            _log_warning(
+                "compute_fsrs_params failed for all known argument shapes: %s",
+                last_type_error,
+            )
             raise RuntimeError("Unable to call compute_fsrs_params with known argument names") from last_type_error
         raise RuntimeError("compute_fsrs_params failed without a result")
 
@@ -671,6 +854,11 @@ def _compute_fsrs_params_for_deck(
     if params is None:
         params = ()
     fsrs_items = _as_int(_field_any(response, ("fsrs_items", "fsrsItems"))) or 0
+    _log_info(
+        "compute_fsrs_params response param_count=%s fsrs_items=%s",
+        len(params),
+        fsrs_items,
+    )
     return params, fsrs_items
 
 
@@ -741,6 +929,7 @@ def _optimize_preset_configs(
     failed = 0
     cancelled = False
     processed = 0
+    _log_info("preset optimization started total=%s log_path=%s", total, _log_file_path())
 
     def _set_progress(done: int, preset_name: str | None) -> None:
         progress.setMaximum(max(total, 0))
@@ -767,8 +956,35 @@ def _optimize_preset_configs(
             config = _config_from_conf_id(conf_id)
             conf_name = _config_name(conf_id, config) if config is not None else f"Preset {conf_id}"
             _set_progress(processed, conf_name)
+            current_params = selected_fsrs_params_from_config_payload(config) or ()
+            relearning_steps = count_relearning_steps_in_day(
+                _extract_relearning_steps(config)
+            )
+            fsrs_version = fsrs_version_for_config_payload(config)
+            include_same_day_reviews = (
+                include_same_day_reviews_for_optimize_from_config_payload(config)
+            )
+            _log_info(
+                "preset optimization processing conf_id=%s preset=%r deck_count=%s "
+                "current_param_count=%s relearning_steps=%s fsrs_version=%s "
+                "include_same_day_reviews=%s",
+                conf_id,
+                conf_name,
+                len(deck_ids),
+                len(current_params),
+                relearning_steps,
+                fsrs_version,
+                include_same_day_reviews,
+            )
 
             if not callable(update_config) or config is None:
+                _log_warning(
+                    "preset optimization cannot update conf_id=%s update_config_callable=%s "
+                    "config_present=%s",
+                    conf_id,
+                    callable(update_config),
+                    config is not None,
+                )
                 failed += 1
                 processed += 1
                 _set_progress(processed, None)
@@ -776,6 +992,11 @@ def _optimize_preset_configs(
 
             search = build_multi_deck_search_query(deck_ids)
             if search is None:
+                _log_warning(
+                    "preset optimization has no search query conf_id=%s deck_ids=%s",
+                    conf_id,
+                    [int(deck_id) for deck_id in deck_ids],
+                )
                 failed += 1
                 processed += 1
                 _set_progress(processed, None)
@@ -784,23 +1005,43 @@ def _optimize_preset_configs(
             try:
                 params, fsrs_items = _compute_fsrs_params_for_deck(
                     search=search,
-                    current_params=extract_fsrs_weights(config) or (),
-                    num_of_relearning_steps=count_relearning_steps_in_day(
-                        _extract_relearning_steps(config)
-                    ),
+                    current_params=current_params,
+                    num_of_relearning_steps=relearning_steps,
+                    fsrs_version=fsrs_version,
+                    include_same_day_reviews=include_same_day_reviews,
                 )
             except Exception:
+                _log_exception(
+                    "preset optimization compute failed conf_id=%s preset=%r",
+                    conf_id,
+                    conf_name,
+                )
                 failed += 1
                 processed += 1
                 _set_progress(processed, None)
                 continue
 
             if fsrs_items <= 0:
+                _log_warning(
+                    "preset optimization skipped no FSRS items conf_id=%s preset=%r "
+                    "param_count=%s",
+                    conf_id,
+                    conf_name,
+                    len(params),
+                )
                 no_data += 1
                 processed += 1
                 _set_progress(processed, None)
                 continue
-            if not is_fsrs6_valid_params(params):
+            if not is_supported_fsrs_params(params):
+                _log_warning(
+                    "preset optimization skipped unsupported params conf_id=%s preset=%r "
+                    "param_count=%s fsrs_items=%s",
+                    conf_id,
+                    conf_name,
+                    len(params),
+                    fsrs_items,
+                )
                 invalid_params += 1
                 processed += 1
                 _set_progress(processed, None)
@@ -822,6 +1063,14 @@ def _optimize_preset_configs(
                 update_config(payload)
                 optimized += 1
             except Exception:
+                _log_exception(
+                    "preset optimization update_config failed conf_id=%s preset=%r "
+                    "param_count=%s fsrs_items=%s",
+                    conf_id,
+                    conf_name,
+                    len(params),
+                    fsrs_items,
+                )
                 failed += 1
 
             processed += 1
@@ -835,7 +1084,55 @@ def _optimize_preset_configs(
         except Exception:
             pass
 
+    _log_info(
+        "preset optimization finished optimized=%s no_data=%s invalid_params=%s "
+        "failed=%s cancelled=%s",
+        optimized,
+        no_data,
+        invalid_params,
+        failed,
+        cancelled,
+    )
     return optimized, no_data, invalid_params, failed, cancelled
+
+
+def _reset_preset_search_filters(conf_id: int, preset_name: str) -> bool:
+    update_config = getattr(mw.col.decks, "update_config", None)
+    if not callable(update_config):
+        _log_warning(
+            "cannot reset preset search filters conf_id=%s preset=%r update_config unavailable",
+            conf_id,
+            preset_name,
+        )
+        return False
+
+    config = _config_from_conf_id(conf_id)
+    if not isinstance(config, Mapping):
+        _log_warning(
+            "cannot reset preset search filters conf_id=%s preset=%r config missing",
+            conf_id,
+            preset_name,
+        )
+        return False
+
+    try:
+        payload = reset_fsrs_search_filters_on_config_payload(config)
+        payload["id"] = int(conf_id)
+        payload["name"] = preset_name
+        update_config(payload)
+        _log_info(
+            "reset FSRS search filters for preset conf_id=%s preset=%r",
+            conf_id,
+            preset_name,
+        )
+        return True
+    except Exception:
+        _log_exception(
+            "failed to reset FSRS search filters for preset conf_id=%s preset=%r",
+            conf_id,
+            preset_name,
+        )
+        return False
 
 
 def _load_computed_deck_profiles(
@@ -2036,6 +2333,7 @@ def _split_deck_by_first_review() -> None:
         else:
             reused_presets += 1
 
+        _reset_preset_search_filters(int(preset_id), preset_name)
         target_preset_assignments[int(target_deck_id)] = int(preset_id)
         moved, failed = _move_cards_to_deck(
             card_ids=buckets[rating],
@@ -2051,10 +2349,33 @@ def _split_deck_by_first_review() -> None:
         failed_count += preset_assign_failed
 
     if total_split > 0:
-        try:
-            mw.reset()
-        except Exception:
-            pass
+        _reset_ui_after_collection_change("first-review split card move")
+
+    optimization_message: str | None = None
+    optimization_failed = 0
+    if target_preset_assignments and failed_count == 0:
+        optimize_choice = QMessageBox.question(
+            mw,
+            "Optimize First Review Presets?",
+            "Do you want to optimize FSRS params for the first-review split presets?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if optimize_choice == QMessageBox.StandardButton.Yes:
+            preset_deck_groups = [
+                (int(preset_id), [int(deck_id)])
+                for deck_id, preset_id in sorted(target_preset_assignments.items())
+            ]
+            optimized, no_data, invalid_params, optimization_failed, cancelled = (
+                _optimize_preset_configs(preset_deck_groups)
+            )
+            optimization_message = preset_optimization_summary_message(
+                optimized=optimized,
+                no_data=no_data,
+                invalid_params=invalid_params,
+                failed=optimization_failed,
+                cancelled=cancelled,
+            )
 
     result_lines = [
         f'Split completed for "{selected_deck_name}".',
@@ -2079,8 +2400,14 @@ def _split_deck_by_first_review() -> None:
         result_lines.append("Failed to create/find target presets:")
         for preset_name in failed_target_presets:
             result_lines.append(f"- {preset_name}")
+    if optimization_message:
+        result_lines.append("")
+        result_lines.append(optimization_message)
     if failed_count:
         showWarning("\n".join(result_lines + [f"Move failures: {failed_count}"]))
+        return
+    if optimization_failed:
+        showWarning("\n".join(result_lines))
         return
     showInfo("\n".join(result_lines))
 
@@ -2119,6 +2446,7 @@ def _merge_back_first_review_split() -> None:
         return
 
     split_deck_names = target_deck_names_for_first_review_split(base_deck_name)
+    split_preset_names = target_preset_names_for_first_review_split(base_deck_name)
     per_label_cards: dict[str, list[int]] = {}
     existing_split_decks = 0
     for _rating, label in FIRST_REVIEW_RATINGS:
@@ -2138,46 +2466,42 @@ def _merge_back_first_review_split() -> None:
         per_label_cards[label] = _card_ids_for_decks(split_scope_ids)
 
     if existing_split_decks == 0:
-        showInfo(f'No "{base_deck_name} - Again/Hard/Good/Easy" decks found.')
+        showInfo(f'No first-review child decks found for "{base_deck_name}".')
         return
 
     total_to_merge = sum(len(card_ids) for card_ids in per_label_cards.values())
-    if total_to_merge <= 0:
-        showInfo("Split decks exist, but there are no cards to merge back.")
-        return
-
-    confirmation_lines = [
-        f'Base deck: "{base_deck_name}"',
-        f"Again -> base: {len(per_label_cards['Again'])}",
-        f"Hard -> base: {len(per_label_cards['Hard'])}",
-        f"Good -> base: {len(per_label_cards['Good'])}",
-        f"Easy -> base: {len(per_label_cards['Easy'])}",
-        f"Total cards to merge back: {total_to_merge}",
-    ]
-    proceed = QMessageBox.question(
-        mw,
-        _FIRST_REVIEW_UNSPLIT_LABEL,
-        "\n".join(confirmation_lines) + "\n\nProceed with merge back?",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.Yes,
-    )
-    if proceed != QMessageBox.StandardButton.Yes:
-        return
+    if total_to_merge > 0:
+        confirmation_lines = [
+            f'Base deck: "{base_deck_name}"',
+            f"Again -> base: {len(per_label_cards['Again'])}",
+            f"Hard -> base: {len(per_label_cards['Hard'])}",
+            f"Good -> base: {len(per_label_cards['Good'])}",
+            f"Easy -> base: {len(per_label_cards['Easy'])}",
+            f"Total cards to merge back: {total_to_merge}",
+        ]
+        proceed = QMessageBox.question(
+            mw,
+            _FIRST_REVIEW_UNSPLIT_LABEL,
+            "\n".join(confirmation_lines) + "\n\nProceed with merge back?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if proceed != QMessageBox.StandardButton.Yes:
+            return
 
     merged_counts: dict[str, int] = {label: 0 for _rating, label in FIRST_REVIEW_RATINGS}
     failed_count = 0
-    for _rating, label in FIRST_REVIEW_RATINGS:
-        moved, failed = _move_cards_to_deck(
-            card_ids=per_label_cards[label],
-            target_deck_id=base_deck_id,
-        )
-        merged_counts[label] = moved
-        failed_count += failed
+    if total_to_merge > 0:
+        for _rating, label in FIRST_REVIEW_RATINGS:
+            moved, failed = _move_cards_to_deck(
+                card_ids=per_label_cards[label],
+                target_deck_id=base_deck_id,
+            )
+            merged_counts[label] = moved
+            failed_count += failed
 
-    try:
-        mw.reset()
-    except Exception:
-        pass
+    if total_to_merge > 0:
+        _reset_ui_after_collection_change("first-review merge card move")
 
     deleted_split_decks: list[str] = []
     delete_failed_split_decks: list[str] = []
@@ -2200,22 +2524,81 @@ def _merge_back_first_review_split() -> None:
         else:
             delete_failed_split_decks.append(split_name)
 
-    result_lines = [
-        f'Merged cards back into "{base_deck_name}".',
-        f"Merged Again: {merged_counts['Again']}",
-        f"Merged Hard: {merged_counts['Hard']}",
-        f"Merged Good: {merged_counts['Good']}",
-        f"Merged Easy: {merged_counts['Easy']}",
-        f"Total merged: {sum(merged_counts.values())}",
-    ]
+    deleted_presets: list[str] = []
+    delete_failed_presets: list[str] = []
+    refreshed_entries = sorted(_deck_entries(), key=lambda item: item[1].lower())
+    all_deck_ids = [int(deck_id) for deck_id, _deck_name in refreshed_entries]
+    current_assignments = _current_preset_assignments(all_deck_ids)
+    used_preset_ids = sorted({int(conf_id) for conf_id in current_assignments.values()})
+    cleanup_candidates = unused_advisor_preset_candidates_by_name(
+        presets=[
+            (int(conf_id), str(conf_name))
+            for conf_id, conf_name, _cfg in _all_preset_configs()
+        ],
+        used_preset_ids=used_preset_ids,
+        preset_names=split_preset_names.values(),
+    )
+    skipped_preset_delete_count = 0
+    if cleanup_candidates:
+        delete_presets_choice = QMessageBox.question(
+            mw,
+            "Delete Unused Split Presets?",
+            (
+                f"Found {len(cleanup_candidates)} unused first-review split preset(s).\n\n"
+                "Deleting deck presets is treated by Anki as a schema change and can "
+                "require a full upload on next sync.\n\n"
+                "Delete these unused presets now?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if delete_presets_choice == QMessageBox.StandardButton.Yes:
+            for conf_id, conf_name in cleanup_candidates:
+                if _delete_preset_by_id(conf_id):
+                    deleted_presets.append(conf_name)
+                else:
+                    delete_failed_presets.append(conf_name)
+        else:
+            skipped_preset_delete_count = len(cleanup_candidates)
+
+    if deleted_split_decks or deleted_presets:
+        _reset_ui_after_collection_change("first-review merge cleanup")
+
+    if total_to_merge > 0:
+        result_lines = [
+            f'Merged cards back into "{base_deck_name}".',
+            f"Merged Again: {merged_counts['Again']}",
+            f"Merged Hard: {merged_counts['Hard']}",
+            f"Merged Good: {merged_counts['Good']}",
+            f"Merged Easy: {merged_counts['Easy']}",
+            f"Total merged: {sum(merged_counts.values())}",
+        ]
+    else:
+        result_lines = [
+            f'No cards found in first-review split decks for "{base_deck_name}".',
+        ]
     if deleted_split_decks:
         result_lines.append(f"Deleted empty split decks: {len(deleted_split_decks)}")
     if delete_failed_split_decks:
         result_lines.append("Failed to delete empty split decks:")
         for deck_name in delete_failed_split_decks:
             result_lines.append(f"- {deck_name}")
+    if deleted_presets:
+        result_lines.append(f"Deleted unused split presets: {len(deleted_presets)}")
+    if skipped_preset_delete_count:
+        result_lines.append(
+            f"Kept unused split presets: {skipped_preset_delete_count} "
+            "(preset deletion requires full sync)"
+        )
+    if delete_failed_presets:
+        result_lines.append("Failed to delete unused split presets:")
+        for preset_name in delete_failed_presets:
+            result_lines.append(f"- {preset_name}")
     if failed_count:
         showWarning("\n".join(result_lines + [f"Move failures: {failed_count}"]))
+        return
+    if delete_failed_split_decks or delete_failed_presets:
+        showWarning("\n".join(result_lines))
         return
     showInfo("\n".join(result_lines))
 

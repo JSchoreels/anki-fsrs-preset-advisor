@@ -36,6 +36,6 @@ def test_preset_optimization_summary_message_includes_all_counters_and_cancelled
     )
     assert "Optimized presets: 2" in message
     assert "Skipped (no FSRS items): 1" in message
-    assert "Skipped (non-FSRS6 params): 3" in message
+    assert "Skipped (unsupported FSRS params): 3" in message
     assert "Failed: 4" in message
     assert "Cancelled before completion." in message

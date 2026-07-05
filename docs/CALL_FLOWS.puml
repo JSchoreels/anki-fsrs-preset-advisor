@@ -1,0 +1,110 @@
+@startuml
+hide footbox
+
+title Add-on init and menu action routing
+
+actor User
+participant "addon.py\ninit_addon()" as Addon
+participant "Anki Tools menu" as ToolsMenu
+participant "addon.py\n_show_preset_results()" as ShowPreset
+participant "addon.py\n_show_deck_computed_results()" as ShowDeck
+
+Addon -> ToolsMenu: add QAction("FSRS Preset Proximity")
+Addon -> ToolsMenu: add QAction("FSRS Deck Proximity (Computed)")
+
+User -> ToolsMenu: click "FSRS Preset Proximity"
+ToolsMenu -> ShowPreset: triggered()
+
+User -> ToolsMenu: click "FSRS Deck Proximity (Computed)"
+ToolsMenu -> ShowDeck: triggered()
+@enduml
+
+@startuml
+hide footbox
+
+title Deck-computed flow to similarity groups editor
+
+actor User
+participant "addon.py\n_show_deck_computed_results()" as DeckFlow
+participant "addon.py\n_load_computed_deck_profiles()" as LoadProfiles
+participant "infra/decks_gateway.py" as Gateway
+participant "tools/search_queries.py" as SearchTools
+participant "addon.py\n_compute_fsrs_params_for_deck()" as Compute
+participant "Anki backend\ncompute_fsrs_params" as Backend
+participant "analyzer.py\npairwise_distance_matrix()" as Pairwise
+participant "tools/grouping.py\nsimilarity_groups_from_matrix()" as Grouping
+participant "addon.py\n_show_similarity_groups()" as GroupsUI
+
+User -> DeckFlow: start action
+DeckFlow -> LoadProfiles: include_middle_and_root + progress callback
+
+loop for each selected deck
+  LoadProfiles -> Gateway: config_for_deck(deck_id)
+  LoadProfiles -> SearchTools: build_deck_search_query(...)
+  alt cache miss
+    LoadProfiles -> Compute: compute(search, current_params, relearning_steps)
+    Compute -> Backend: compute_fsrs_params(...)
+    Backend --> Compute: params + fsrs_items
+    Compute --> LoadProfiles: params + fsrs_items
+  else cache hit
+    LoadProfiles --> LoadProfiles: reuse cached params
+  end
+end
+
+LoadProfiles --> DeckFlow: profiles + skipped/fail lists + cancelled flag
+DeckFlow -> Pairwise: pairwise_distance_matrix(profiles)
+Pairwise --> DeckFlow: ordered_profiles + matrix
+DeckFlow -> Grouping: similarity_groups_from_matrix(..., min_group_size=1)
+Grouping --> DeckFlow: similarity groups
+DeckFlow -> GroupsUI: open editor with groups + matrix + preset groups
+@enduml
+
+@startuml
+hide footbox
+
+title "Use Recommended Group" apply and optional re-optimization
+
+actor User
+participant "addon.py\n_show_similarity_groups()" as SimilarityUI
+participant "nested _use_recommended_groups()" as UseRecommended
+participant "infra/decks_gateway.py" as Gateway
+participant "use_cases/preset_reoptimization.py" as ReoptUseCase
+participant "addon.py\n_optimize_preset_configs()" as Optimize
+participant "addon.py\n_compute_fsrs_params_for_deck()" as Compute
+participant "Anki backend\ncompute_fsrs_params" as Backend
+
+User -> SimilarityUI: click "Use Recommended Group"
+SimilarityUI -> UseRecommended: execute
+UseRecommended -> Gateway: all_preset_configs()
+
+loop each recommended group
+  alt advisor preset already exists
+    UseRecommended --> UseRecommended: reuse preset id
+  else not existing
+    UseRecommended -> Gateway: create preset via decks API
+  end
+  UseRecommended --> UseRecommended: build target_by_deck
+end
+
+UseRecommended -> Gateway: current_preset_assignments(target decks)
+UseRecommended -> Gateway: apply_preset_assignments(target_by_deck)
+UseRecommended -> Gateway: current_preset_assignments(target decks)
+UseRecommended -> Gateway: deck_entries() + current_preset_assignments(all decks)
+UseRecommended -> ReoptUseCase: changed_preset_deck_groups_for_reoptimization(...)
+ReoptUseCase --> UseRecommended: changed_preset_deck_groups
+
+alt user accepts "Optimize Changed Presets?"
+  UseRecommended -> Optimize: optimize changed preset deck groups
+  loop each changed preset
+    Optimize -> Compute: compute for grouped deck search
+    Compute -> Backend: compute_fsrs_params(...)
+    Backend --> Compute: params + fsrs_items
+    Compute --> Optimize: params + fsrs_items
+    Optimize -> Gateway: config_from_conf_id(...) + update_config(...)
+  end
+  Optimize --> UseRecommended: optimized/no_data/invalid/failed/cancelled
+  UseRecommended -> ReoptUseCase: preset_optimization_summary_message(...)
+end
+
+UseRecommended --> SimilarityUI: show result summary + close dialog
+@enduml

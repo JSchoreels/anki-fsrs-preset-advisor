@@ -39,7 +39,7 @@ def preset_optimization_summary_message(
     lines = [
         f"Optimized presets: {optimized}",
         f"Skipped (no FSRS items): {no_data}",
-        f"Skipped (non-FSRS6 params): {invalid_params}",
+        f"Skipped (unsupported FSRS params): {invalid_params}",
         f"Failed: {failed}",
     ]
     if cancelled:
